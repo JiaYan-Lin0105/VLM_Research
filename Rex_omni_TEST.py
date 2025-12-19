@@ -1,83 +1,62 @@
-import torch
 import os
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+import torch
 from PIL import Image
-import requests
+from rex_omni import RexOmniWrapper, RexOmniVisualize
+import json
+# 1. 處理模型路徑 (針對 Windows 的絕對路徑優化)
+# 確保路徑格式正確，避免 Transformers 誤認為是 Repo ID
+model_dir = "../models/Rex_omni"
+abs_model_path = os.path.abspath(model_dir).replace("\\", "/")
 
-# 开启详细错误追踪，防止报错信息被掩盖
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+print(f"正在初始化模型自: {abs_model_path}")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-# 1. 加载处理器和模型
-model_path = "./models/Rex_omni"
-# 使用 use_fast=False 避开你之前看到的 Fast Processor 警告，增加稳定性
-processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
-
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    model_path,
-    trust_remote_code=True,
-    # 修正 torch_dtype 警告，使用 dtype
-    dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-    device_map="auto" if device == "cuda" else None,
+# 2. 初始化模型
+# 加入 attn_implementation="sdpa" 避免 FlashAttention2 報錯
+# 加入 torch_dtype 節省顯存
+model = RexOmniWrapper(
+    model_path=abs_model_path,
+    backend="transformers",
+    attn_implementation="sdpa",
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
 )
 
-# --- 关键修正：强制对齐 Embedding 层 ---
-# 如果微调时新增了 Token，这里必须手动调整模型大小，否则就会报错 IndexError
-if len(processor.tokenizer) > model.config.vocab_size:
-    print(f"检测到词表扩充: {model.config.vocab_size} -> {len(processor.tokenizer)}")
-    model.resize_token_embeddings(len(processor.tokenizer))
+# 3. 讀取圖片 (建議增加 .convert("RGB") 確保格式正確)
+image_path = "../images/China_MotorBike_001461.jpg" # 請確認路徑正確
+if not os.path.exists(image_path):
+    print(f"錯誤：找不到圖片 {image_path}")
+    
+    # 這裡可以用你之前的 person_dog.jpg 測試
+else:
+    image = Image.open(image_path).convert("RGB")
 
-# 2. 准备图像 (确保转换为 RGB)
-url = "./images/China_MotorBike_001239.jpg"
-raw_image = Image.open(url).convert("RGB")
+# 4. 瑕疵檢測推理
+# 類別使用具體的描述詞，有助於 VLM 識別
+defect_categories = ["scratch"]
 
-# 3. 构造消息
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "image": raw_image},
-            {"type": "text", "text": "How many road defect in the image?"}
-        ]
-    },
-]
+results = model.inference(
+    images=image,
+    task="detection",
+    categories=defect_categories,
+    # 額外參數：確保輸出完整且不亂跳
+    max_new_tokens=1024,
+    do_sample=False 
+)
 
-# 4. 生成 Inputs
-# 确保使用 apply_chat_template 转换
-prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+result = results[0]
 
-inputs = processor(
-    text=[prompt],
-    images=[raw_image],
-    padding=True,
-    return_tensors="pt",
-).to(device)
-
-# --- 防御性 ID 检查 ---
-max_id = inputs["input_ids"].max().item()
-vocab_limit = model.get_input_embeddings().weight.shape[0]
-print(f"检查：最大 Token ID = {max_id}, 模型词表限制 = {vocab_limit}")
-
-if max_id >= vocab_limit:
-    raise ValueError(f"致命错误：Token ID {max_id} 越界！请检查是否缺少模型权重文件中的特殊标记定义。")
-
-# 5. 生成输出
-with torch.inference_mode():
-    outputs = model.generate(
-        **inputs, 
-        max_new_tokens=128,
-        do_sample=False,
-        use_cache=True
-    )
-
-# 6. 解码
-# 仅截取生成的回复部分
-input_len = inputs["input_ids"].shape[1]
-generated_ids = outputs[0][input_len:]
-response = processor.decode(generated_ids, skip_special_tokens=True)
-
-print("\n" + "="*30)
-print("模型回答:", response)
-print("="*30)
+# 5. 列印檢測結果 (方便偵錯)
+# print(results)
+output_data = results[0]
+with open("scratch_detection_results.json", "w", encoding="utf-8") as f:
+    json.dump(output_data, f, indent=4, ensure_ascii=False)
+# 6. 可視化並儲存
+vis = RexOmniVisualize(
+    image=image,
+    predictions=result["extracted_predictions"],
+    font_size=20,
+    draw_width=5,
+    show_labels=True,
+)
+output_name = "./scratch_visualize.jpg"
+vis.save(output_name)
+print(f"\n視覺化結果已儲存至: {output_name}")
